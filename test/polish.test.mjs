@@ -213,12 +213,17 @@ describe("elicitation for gated tools", () => {
     });
   });
 
-  for (const [label, reply] of [["decline", { action: "decline" }], ["cancel", { action: "cancel" }], ["accept without approve", { action: "accept", content: { approve: false } }]]) {
+  for (const [label, reply, pattern] of [
+    ["decline", { action: "decline" }, /client returned decline/],
+    ["cancel", { action: "cancel" }, /client returned cancel/],
+    ["accept without approve", { action: "accept", content: { approve: false } }, /content\.approve was not true/],
+  ]) {
     it(`${label} keeps the refusal and runs nothing`, async () => {
       await withClient({ elicitation: { form: {} } }, async () => reply, async (client, sb) => {
         const r = await client.callTool({ name: "drive_delete", arguments: { path: "/trash/a.txt", confirmed: false } });
         assert.equal(r.isError, true);
-        assert.match(text(r), /confirmed=true/);
+        assert.match(text(r), pattern);
+        assert.doesNotMatch(text(r), /explicit approval$/);
         assert.deepEqual(nonVersionCalls(sb.argvLog), []);
       });
     });
@@ -235,7 +240,7 @@ describe("elicitation for gated tools", () => {
     await withClient({ elicitation: { form: {} } }, async () => ({ action: "decline" }), async (client, sb) => {
       const r = await client.callTool({ name: "drive_empty_trash", arguments: {} });
       assert.equal(r.isError, true);
-      assert.match(text(r), /confirmed=true/);
+      assert.match(text(r), /client returned decline/);
       assert.deepEqual(nonVersionCalls(sb.argvLog), []);
     });
     await withClient({}, null, async (client, sb) => {
@@ -246,11 +251,12 @@ describe("elicitation for gated tools", () => {
     });
   });
 
-  it("a throwing elicitation handler falls back to the refusal", async () => {
+  it("a throwing elicitation handler refuses with an exception diagnostic and runs nothing", async () => {
     await withClient({ elicitation: { form: {} } }, async () => { throw new Error("boom"); }, async (client, sb) => {
       const r = await client.callTool({ name: "drive_empty_trash", arguments: { confirmed: false } });
       assert.equal(r.isError, true);
-      assert.match(text(r), /confirmed=true/);
+      assert.match(text(r), /approval request failed \(.*boom/);
+      assert.match(text(r), /not an approval/);
       assert.deepEqual(nonVersionCalls(sb.argvLog), []);
     });
   });
@@ -294,12 +300,17 @@ describe("elicitation for gated tools", () => {
       if (tool === "drive_bulk_move") assert.match(msg, /\/my-files\/d/);
     });
 
-    for (const [label, reply] of [["decline", { action: "decline" }], ["cancel", { action: "cancel" }], ["accept without approve", { action: "accept", content: { approve: false } }]]) {
+    for (const [label, reply, pattern] of [
+      ["decline", { action: "decline" }, /client returned decline/],
+      ["cancel", { action: "cancel" }, /client returned cancel/],
+      ["accept without approve", { action: "accept", content: { approve: false } }, /content\.approve was not true/],
+    ]) {
       it(`${tool} confirmed=true: ${label} refuses and runs nothing`, async () => {
         await withClient({ elicitation: { form: {} } }, async () => reply, async (client, sb) => {
           const r = await client.callTool({ name: tool, arguments: args });
           assert.equal(r.isError, true);
-          assert.match(text(r), /did not approve/);
+          assert.match(text(r), pattern);
+          assert.match(text(r), /Nothing was changed|nothing moved|nothing trashed/);
           assert.deepEqual(mutations(sb), []);
         }, "tree", { FAKE_TREE: BULK_TREE() });
       });
@@ -307,7 +318,9 @@ describe("elicitation for gated tools", () => {
 
     it(`${tool} confirmed=true: an erroring handler refuses; no capability keeps today's behaviour`, async () => {
       await withClient({ elicitation: { form: {} } }, async () => { throw new Error("boom"); }, async (client, sb) => {
-        assert.equal((await client.callTool({ name: tool, arguments: args })).isError, true);
+        const r = await client.callTool({ name: tool, arguments: args });
+        assert.equal(r.isError, true);
+        assert.match(text(r), /approval request failed/);
         assert.deepEqual(mutations(sb), []);
       }, "tree", { FAKE_TREE: BULK_TREE() });
       await withClient({}, null, async (client, sb) => {
@@ -363,7 +376,7 @@ describe("elicitation for gated tools", () => {
       for (let i = 0; i < 8; i++) {
         const r = await client.callTool({ name: "drive_delete", arguments: { path: "/trash/a.txt", confirmed: false } });
         assert.equal(r.isError, true);
-        assert.match(text(r), /confirmed=true/);
+        assert.match(text(r), i < 5 ? /client returned decline/ : /prompting is paused/);
       }
       assert.equal(asked, 5);
       assert.deepEqual(nonVersionCalls(sb.argvLog), []);

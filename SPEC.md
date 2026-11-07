@@ -87,6 +87,7 @@ Tested against Proton Drive CLI 0.8.x (`TESTED_CLI = "0.8"` in `src/utils/cliVer
 
 - All argv built as arrays for `spawn` (no shell); flag injection blocked by validators.
 - `confirmed: true` required for destructive or outward-facing tools (delete, empty trash, remove-all, album delete, invite, revoke, public links, leave, reject, logout, remove-from-album) and for the `replace` / `remove` conflict strategies and overwriting a sync-folder file. The CLI requires `--confirm` for the destructive ones.
+- When the client advertises `elicitation.form`, `drive_bulk_move` and `drive_bulk_trash` still require an elicitation result of `action: "accept"` with `content.approve: true` before applying, even if `confirmed` is already true. Decline, cancel, timeout, a malformed response, an error, or a client that rejects the form leaves the plan unapplied. The model argument `confirmed: true` is not a second approval path.
 - Local paths: credential-location denylist (or `PROTON_DRIVE_LOCAL_ROOT` allowlist), symlinks resolved first.
 - Errors never echo the command line; output is truncated.
 - CLI children run in their own process group and are killed on timeout, cancellation, disconnect and SIGTERM/SIGINT.
