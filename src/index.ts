@@ -54,6 +54,16 @@ import { driveContentIndex, driveSearchContent } from "./services/contentIndex.j
 import { snapshotBeforeOverwrite, snapshotLocalBeforeOverwrite, snapshotEnabled, type Snapshot } from "./services/snapshot.js";
 import { AuditLog, auditLogInside, redactArgs } from "./utils/audit.js";
 import { parseRemoteRoots, pathInRoots } from "./utils/remoteroots.js";
+import {
+  approvalPromptPaused,
+  approvalRequest,
+  classifyElicitationError,
+  classifyElicitationResult,
+  elicitationTimeoutMs,
+  recordApprovalMiss,
+  throttleDecision,
+  type ApprovalDecision,
+} from "./utils/approval.js";
 
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json") as { version?: string };
@@ -1419,18 +1429,12 @@ const GetPromptLooseSchema = GetPromptRequestSchema.extend({
   params: GetPromptRequestSchema.shape.params.extend({ arguments: CallToolRequestSchema.shape.params.shape.arguments }),
 });
 
-async function elicitApproval(server: Server, message: string, signal?: AbortSignal): Promise<boolean> {
+async function elicitApproval(server: Server, message: string, signal: AbortSignal | undefined, timeoutMs: number): Promise<ApprovalDecision> {
   try {
-    const res = await server.elicitInput(
-      {
-        message,
-        requestedSchema: { type: "object", properties: { approve: { type: "boolean", title: "Approve this action", default: false } }, required: ["approve"] },
-      },
-      { timeout: 120_000, signal },
-    );
-    return res.action === "accept" && res.content?.approve === true;
-  } catch {
-    return false;
+    const res = await server.elicitInput(approvalRequest(message), { timeout: timeoutMs, signal });
+    return classifyElicitationResult(res);
+  } catch (err) {
+    return classifyElicitationError(err);
   }
 }
 
@@ -1451,19 +1455,19 @@ export async function main() {
   const activeDefs = mode === "readonly" ? tierDefs.filter((t) => !MUTATING_TOOL_NAMES.has(t.name)) : tierDefs;
   const withinRoots = (path: string) => !remoteRoots || pathInRoots(path, remoteRoots);
 
-  // A looping model must not be able to spam the human: after this many declined/cancelled
-  // prompts within a minute, refuse without prompting until the window clears.
+  // A looping model must not be able to spam the human: after this many declined, cancelled,
+  // or timed-out prompts within a minute, refuse without prompting until the window clears.
+  // Protocol errors are not counted, so a broken client does not hide its diagnostic behind the pause.
   const declinedAt: number[] = [];
-  const MAX_DECLINED_PER_MINUTE = 5;
+  const elicitTimeoutMs = elicitationTimeoutMs(process.env);
   const canElicit = () => !!server.getClientCapabilities()?.elicitation?.form;
-  // Returns true only when the human approved. Never prompts when the client cannot, or when over budget.
-  const askApproval = async (message: string): Promise<boolean> => {
+  // Approved only for action accept with content.approve true. Never prompts when the client cannot, or when over budget.
+  const askApproval = async (message: string): Promise<ApprovalDecision> => {
     const now = Date.now();
-    while (declinedAt.length && now - declinedAt[0] > 60_000) declinedAt.shift();
-    if (declinedAt.length >= MAX_DECLINED_PER_MINUTE) return false;
-    const approved = await elicitApproval(server, message, callContext.getStore()?.signal);
-    if (!approved) declinedAt.push(now);
-    return approved;
+    if (approvalPromptPaused(declinedAt, now)) return throttleDecision();
+    const decision = await elicitApproval(server, message, callContext.getStore()?.signal, elicitTimeoutMs);
+    if (!decision.approved) recordApprovalMiss(declinedAt, now, decision.code);
+    return decision;
   };
 
   const server = new Server(
@@ -1783,8 +1787,9 @@ export async function main() {
             return ok({ applied: false, ...movePlan, next: movePlan.problems.length ? "Fix problems first." : "Get user approval, then confirmed=true." });
           }
           if (movePlan.problems.length) return fail(`drive_bulk_move not applied, nothing moved: ${JSON.stringify(movePlan.problems)}`);
-          if (canElicit() && !(await askApproval(bulkPrompt("drive_bulk_move", "Move", sources, destFolder)))) {
-            return fail("drive_bulk_move not applied, nothing moved: the user did not approve.");
+          if (canElicit()) {
+            const approval = await askApproval(bulkPrompt("drive_bulk_move", "Move", sources, destFolder));
+            if (!approval.approved) return failWith("refused", "approval", `drive_bulk_move not applied, nothing moved: ${approval.summary}`);
           }
           try { await drive.bulkMove(sources, destFolder); } finally { invalidatePath(destFolder); sources.forEach(invalidatePath); }
           return ok({ applied: true, moved: movePlan.plan.length, plan: movePlan.plan });
@@ -1797,8 +1802,9 @@ export async function main() {
             return ok({ applied: false, ...trashPlan, next: trashPlan.problems.length ? "Fix problems first." : "Get user approval, then confirmed=true." });
           }
           if (trashPlan.problems.length) return fail(`drive_bulk_trash not applied, nothing trashed: ${JSON.stringify(trashPlan.problems)}`);
-          if (canElicit() && !(await askApproval(bulkPrompt("drive_bulk_trash", "Trash", trashPaths)))) {
-            return fail("drive_bulk_trash not applied, nothing trashed: the user did not approve.");
+          if (canElicit()) {
+            const approval = await askApproval(bulkPrompt("drive_bulk_trash", "Trash", trashPaths));
+            if (!approval.approved) return failWith("refused", "approval", `drive_bulk_trash not applied, nothing trashed: ${approval.summary}`);
           }
           try { await drive.bulkTrash(trashPaths); } finally { trashPaths.forEach(invalidatePath); }
           return ok({ applied: true, trashed: trashPlan.plan.length, plan: trashPlan.plan });
@@ -2091,8 +2097,9 @@ export async function main() {
         // let the human (never the model) grant it; any failure keeps the refusal.
         if (!confirmationRefusals.has(first) || !canElicit()) return first;
         const reason = (first.content?.[0]?.text ?? "").replace(/\s*(Describe this to the user|Ask the user|Show the user|Use \w+ first).*$/s, "");
-        const asked = await askApproval(`${req.params.name} needs your approval. ${showValue(reason, 300, 100)}\n${describeArgs(req.params.arguments ?? {})}`);
-        return asked ? handleCall({ params: { ...req.params, arguments: { ...(req.params.arguments ?? {}), confirmed: true } } }) : first;
+        const approval = await askApproval(`${req.params.name} needs your approval. ${showValue(reason, 300, 100)}\n${describeArgs(req.params.arguments ?? {})}`);
+        if (!approval.approved) return failWith("refused", "approval", `${req.params.name} not applied, nothing changed: ${approval.summary}`);
+        return handleCall({ params: { ...req.params, arguments: { ...(req.params.arguments ?? {}), confirmed: true } } });
       });
     } finally {
       inFlight--;

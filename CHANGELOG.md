@@ -5,6 +5,12 @@
 ### Added
 - **`drive_size` tool** (read-only, allowed in readonly mode, in the full tier only): size of one file or folder from the official CLI command `proton-drive filesystem size <path>`, which exists from CLI 0.9.0. The path honours `PROTON_DRIVE_REMOTE_ROOTS`. On CLI 0.8.x the command is unknown and the tool fails with "drive_size needs Proton Drive CLI 0.9.0 or newer". Now 55 tools; `drive_size` is MCP-only in the companion CLI. Not live-tested against a real account (output shape follows the CLI as-is, passed through the same noise trimming as `drive_info`).
 
+### Fixed
+- **Approval diagnostics for form elicitation.** `drive_bulk_move` / `drive_bulk_trash` (and a refused `confirmed` gate) no longer collapse every unsuccessful form into "the user did not approve". The call still runs only when the client returns `action: "accept"` and `content.approve: true`. Decline, cancel, timeout, a malformed or incomplete accept, a thrown elicitation error, a client that advertises `elicitation.form` but rejects `elicitation/create`, and the one-minute pause after 5 declines, cancellations, or timeouts each return their own sanitized message and change nothing. Error text is one line with control characters, stack frames, and absolute paths removed. Protocol errors do not consume the pause budget, so a broken client does not start looking like a human refusal on the next call. `PROTON_DRIVE_ELICIT_TIMEOUT_MS` (20 through 120000) only shortens the wait; an invalid value keeps 120 seconds. It cannot approve a call.
+
+### Notes
+- This does not make a host apply the move. SDK 1.32.2 already sends a spec-valid `elicitation/create` (`mode: "form"`, one boolean `approve`, default false). Upstream 1.9.0 uses that same gate. Cursor CLI `cursor-agent` 2026.11.05 advertises `elicitation.form` and, when no elicitation provider is installed, answers `{ "action": "decline" }` immediately with no form (Cursor staff confirmed this on 2026-11-06). The editor can show the form, sometimes only inside a collapsed tool row. A decline, a hidden form, or a timeout is still a refusal here. The host fix is to show the form and return `content.approve: true` only after an explicit approval, or to stop advertising `elicitation.form` until it can. Shipping this server does not deploy that host change, and it does not move any Drive files.
+
 ## 1.9.0 — 2026-11-06
 
 ### Added
